@@ -15,6 +15,62 @@ class Plot:
         latex.SetTextFont(42)
         latex.DrawLatex(0.12, 0.91, "#bf{CMS} #it{Preliminary}")
 
+
+    @staticmethod
+    def plot_histogram1D(histogram: ROOT.TH1D,
+                         name: str,
+                         xlabel: str) -> ROOT.TCanvas:
+        """
+        Plot a single TH1D histogram on a canvas.
+        
+        Args:
+            histogram: TH1D histogram to plot
+            xlabel: Label for x-axis
+        
+        Returns:
+            ROOT.TCanvas: The created canvas with the plotted histogram
+        """
+        # Create canvas
+        canvas = ROOT.TCanvas(f"can_{name}_{histogram.GetName()}", "Histogram Plot", 800, 600)
+        canvas.cd()
+        
+        # Set up canvas properties
+        canvas.SetGrid()
+        canvas.SetLogy()
+        
+        # Set up histogram properties
+        histogram.SetStats(0)
+        histogram.SetTitle("")
+        histogram.GetXaxis().SetTitle(xlabel)
+        histogram.GetYaxis().SetTitle("Entries")
+        histogram.GetXaxis().CenterTitle(True)
+        histogram.GetYaxis().CenterTitle(True)
+    
+        # Set histogram style
+        histogram.SetLineWidth(3)
+        histogram.SetLineColor(ROOT.kBlue + 2)
+        
+        # Set y-axis range
+        max_y = histogram.GetMaximum()
+        y_max = max_y * 1.2
+        histogram.GetYaxis().SetRangeUser(0.01, y_max)
+        
+        # Draw histogram
+        histogram.Draw("HIST")
+        
+        # Update canvas
+        canvas.Update()
+        
+        # Draw CMS mark
+        Plot.CMSmark()
+        
+        # Store histogram and force another update
+        canvas.histogram = histogram
+        canvas.Modified()
+        canvas.Update()
+        
+        return canvas
+        
     @staticmethod
     def plot_histograms(histograms: List[ROOT.TH1D],
                        labels: List[str], 
@@ -49,7 +105,7 @@ class Plot:
         # Find maximum y-value first
         max_y = max(h.GetMaximum() for h in root_hists)
         y_max = max_y * 1.2
-        
+         
         # Define colors
         colors = [
             ROOT.kBlue + 2,
@@ -67,6 +123,8 @@ class Plot:
         root_hists[0].SetTitle("")
         root_hists[0].GetXaxis().SetTitle(xlabel)
         root_hists[0].GetYaxis().SetRangeUser(0.01, y_max)
+        root_hists[0].GetXaxis().CenterTitle(True)
+        root_hists[0].GetYaxis().CenterTitle(True)
         
         # Plot histograms with explicit options
         for i, hist in enumerate(root_hists):
@@ -130,6 +188,8 @@ class Plot:
         root_hist.GetXaxis().SetTitle(xlabel)
         root_hist.GetYaxis().SetTitle(ylabel)
         root_hist.GetZaxis().SetTitle(zlabel)
+        root_hist.GetXaxis().CenterTitle(True)
+        root_hist.GetYaxis().CenterTitle(True)
         
         # Set canvas properties
         canvas.SetGridx()
@@ -226,6 +286,75 @@ class Plot:
         
         return canvas
 
+    @staticmethod
+    def plot_histogram2D_division(numerator: ROOT.TH2D,
+                                  denominator: ROOT.TH2D,
+                                  name: str,
+                                  xlabel: str,
+                                  ylabel: str,
+                                  title: str = "Ratio") -> ROOT.TCanvas:
+        """
+        Divide two TH2D histograms and plot the result on a canvas.
+    
+        Args:
+            numerator: TH2D histogram for the numerator
+            denominator: TH2D histogram for the denominator
+            name: Name identifier for the canvas
+            xlabel: Label for x-axis
+            ylabel: Label for y-axis
+            title: Title for the z-axis (default: "Efficiency")
+        
+        Returns:
+            ROOT.TCanvas: The created canvas with the plotted ratio histogram
+        """
+        # Create a copy of the numerator for the ratio
+        ratio = numerator.Clone(f"ratio_{name}")
+        ratio.SetTitle("")
+        
+        # Perform the division with binomial errors
+        ratio.Divide(numerator, denominator, 1.0, 1.0, "B")
+        
+        # Create canvas
+        canvas = ROOT.TCanvas(f"can_{name}_ratio", "2D Histogram Division", 900, 700)
+        canvas.cd()
+        
+        # Set up canvas properties
+        canvas.SetGrid()
+        canvas.SetRightMargin(0.15)  # Make room for color palette
+        
+        # Set up histogram properties
+        ratio.SetStats(0)
+        ratio.GetXaxis().SetTitle(xlabel)
+        ratio.GetYaxis().SetTitle(ylabel)
+        ratio.GetZaxis().SetTitle(title)
+        ratio.GetXaxis().CenterTitle(True)
+        ratio.GetYaxis().CenterTitle(True)
+        ratio.GetZaxis().CenterTitle(True)
+        
+        # Set z-axis range (0 to 1 for efficiency plots)
+        #ratio.GetZaxis().SetRangeUser(0.0, 1.0)
+        
+        # Set histogram style
+        ratio.SetMarkerSize(0.8)
+        
+        # Draw histogram with color palette
+        ratio.Draw("COLZ")
+        
+        # Update canvas
+        canvas.Update()
+        
+        # Draw CMS mark
+        Plot.CMSmark()
+        
+        # Store histograms and force another update
+        canvas.ratio = ratio
+        canvas.numerator = numerator
+        canvas.denominator = denominator
+        canvas.Modified()
+        canvas.Update()
+    
+        return canvas
+    
 class EfficiencyPlotter:
     def __init__(self, histograms):
         self.histograms = histograms

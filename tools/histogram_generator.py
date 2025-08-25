@@ -1,9 +1,10 @@
 import numpy as np
+import uproot
 import awkward as ak
 import boost_histogram as bh
 import itertools
 from dataclasses import dataclass, replace
-from typing import Dict, List, Set, Optional, Tuple, Callable, Union
+from typing import Any, Dict, List, Set, Optional, Tuple, Callable, Union
 from tools.histogram_dictionary import VARIABLES, HistogramConfig
 from tools.functional_variable import FunctionalVariable
 
@@ -24,6 +25,7 @@ class CollectionConfig:
     global_filter: Optional[Callable[[Dict], ak.Array]] = None
     skip_variables: Optional[List[str]] = None
     functional_variables: Optional[Dict[str, FunctionalVariable]] = None
+    dependencies: Optional[List[str]] = None
     
     def copy(self) -> 'CollectionConfig':
         """Create a deep copy of the configuration."""
@@ -146,6 +148,16 @@ class CollectionConfig:
             new_config.global_filter = lambda arrays: original_filter(arrays) & additional_filter(arrays)
         return new_config
 
+    def add_dependencies(self, *additional_dependencies: str) -> 'CollectionConfig':
+        """Add an additional condition to the global filter."""
+        new_config = self.copy()
+        if new_config.dependencies is None:
+            new_config.dependencies = additional_dependencies
+        else:
+            original_dependencies = new_config.dependencies
+            new_config.dependencies.extend(additional_dependencies)
+        return new_config
+    
     def replace_global_filter(self, new_filter: Callable[[Dict], ak.Array]) -> 'CollectionConfig':
         """Replace the global filter entirely."""
         new_config = self.copy()
@@ -259,6 +271,10 @@ class HistogramGenerator:
                         continue
                     else:
                         branches.add(branch)
+
+        if self.config.dependencies:
+            for branch in self.config.dependencies:
+                branches.add(f"{self.config.prefix}_{branch}")
                 
         return branches
 
@@ -291,6 +307,9 @@ class HistogramGenerator:
     def _create_category_masks(self, arrays: Dict) -> Dict[str, Tuple[ak.Array, Optional[str]]]:
         """Create masks for different categories, returning both mask and any needed mapping index."""
         masks = {}
+
+        if len(self.category_masks) == 0:
+            return masks
         
         # Create individual category masks
         for mask_config in self.category_masks:
@@ -298,21 +317,28 @@ class HistogramGenerator:
             mask = arrays[f"{self.config.prefix}_{mask_config.name}"]
             mapping_index = mask_config.mapping_index
             masks[key] = (mask, mapping_index)
-            
+
+        """
         # Create background mask (not belonging to any category)
         background_mask = ak.ones_like(arrays[f"{self.config.prefix}_{self.category_masks[0].name}"])
+
         for mask_config in self.category_masks:
             background_mask = background_mask & (~arrays[f"{self.config.prefix}_{mask_config.name}"])
         masks["background"] = (background_mask, None)
-        
+        """
         return masks
 
     def _create_alternate_masks(self, arrays: Dict) -> Dict:
+
+        masks = {}
+	
+        if len(self.config.alternate_masks) == 0:
+            return masks
+
         """Create alternate masks if specified."""
         if not self.config.alternate_masks:
             return {"any": ak.ones_like(arrays[f"{self.config.prefix}_{self.category_masks[0].name}"])}
             
-        masks = {}
         for branch in self.config.alternate_masks:
             key = branch.replace("is", "").lower()
             masks[key] = arrays[f"{self.config.prefix}_{branch}"]
@@ -340,117 +366,254 @@ class HistogramGenerator:
             return mask[vertex_index]
         return mask
 
-    def create_histograms(self, events) -> Dict[str, bh.Histogram]:
-        """Create histograms for all combinations of categories and variables."""
+    def _prepare_arrays(self, arrays):
+        """Prepare arrays by computing derived and functional variables."""
+        arrays = self._compute_derived_variables(arrays)
+        arrays = self._compute_functional_variables(arrays)
+        return arrays
 
+    def _prepare_masks(self, arrays) -> Dict[str, Any]:
+        """Create and prepare all masks needed for histogram creation."""
+        category_masks = self._create_category_masks(arrays)
+        alternate_masks = self._create_alternate_masks(arrays)
+        
+        # Apply global filter if specified
+        # Find a reference array to create the global filter shape
+        if self.category_masks:
+            # Use the first category mask as reference if available
+            reference_array = arrays[f"{self.config.prefix}_{self.category_masks[0].name}"]
+        elif self.variables:
+            # Fall back to the first variable if no category masks
+            reference_array = arrays[f"{self.config.prefix}_{self.variables[0]}"]
+        else:
+            # Last resort: use any available array
+            reference_key = next(iter(arrays.keys()))
+            reference_array = arrays[reference_key]
+            
+        global_filter = ak.ones_like(reference_array, dtype=bool)
+        if self.config.global_filter is not None:
+            global_filter = self.config.global_filter(arrays)
+            
+        return {
+            'category_masks': category_masks,
+            'alternate_masks': alternate_masks,
+            'global_filter': global_filter
+        }
+    
+    def _create_batch_histograms(self, arrays, masks) -> Dict[str, bh.Histogram]:
+        """Create all histograms for the current batch of arrays."""
+        batch_histograms = {}
+        
+        # Handle empty masks with sensible defaults
+        category_masks = masks['category_masks']
+        alternate_masks = masks['alternate_masks']
+        
+        # If no categories defined, create a default "all" category with no mask
+        if not category_masks:
+            default_mask = ak.ones_like(masks['global_filter'], dtype=bool)
+            default_mapping_index = 0  # or whatever default mapping makes sense
+            category_masks = {'all': (default_mask, default_mapping_index)}
+            
+        # If no alternates defined, create a default with no alternate mask
+        if not alternate_masks:
+            alternate_masks = {None: None}
+
+        for category_name, (category_mask, mapping_index) in category_masks.items():
+            for alt_name, alt_mask in alternate_masks.items():
+                # Create 1D histograms
+                self._create_1d_histograms(
+                    arrays, batch_histograms, category_name, alt_name,
+                    category_mask, alt_mask, masks['global_filter'], mapping_index
+                )
+                
+                # Create 2D histograms
+                self._create_2d_histograms(
+                    arrays, batch_histograms, category_name, alt_name,
+                    category_mask, alt_mask, masks['global_filter'], mapping_index
+                )
+                
+        return batch_histograms
+
+    def _create_nTotal_histogram(self, arrays, histograms, category_name, alt_name,
+                                 category_mask, alt_mask, global_filter, mapping_index):
+        """Creates and fills the 'nTotal' histogram for object counts per event."""
+
+        if not self.variables:  # Do nothing if no variables are defined for the collection
+            return
+
+        # Use the first variable as a representative for applying masks
+        representative_variable = self.variables[0] #
+
+        # Create the combined mask using the representative variable's context
+        nTotal_combined_mask = self._create_combined_mask(
+            arrays, category_mask, alt_mask, global_filter, representative_variable, mapping_index
+        ) #
+
+        # Get the data for the representative variable to count selected objects from
+        representative_branch_name = f"{self.config.prefix}_{representative_variable}" #
+
+        if representative_branch_name not in arrays.fields:
+            return
+
+        objects_for_counting = arrays[representative_branch_name] #
+        selected_objects_per_event = objects_for_counting[nTotal_combined_mask] #
+        counts_per_event = ak.num(selected_objects_per_event) #
+
+        # self._get_histogram_key needs to be defined in your class
+        nTotal_key = self._get_histogram_key(category_name, alt_name, "nTotal") #
+
+        hist_config = self._get_histogram_config("nTotal")
+        nTotal_axis = bh.axis.Integer(
+            start=hist_config.start,
+            stop=hist_config.stop,
+        )
+
+        histograms[nTotal_key] = bh.Histogram(nTotal_axis) #
+        histograms[nTotal_key].fill(counts_per_event) #
+
+    def _create_1d_histograms(self, arrays, histograms, category_name, alt_name,
+                              category_mask, alt_mask, global_filter, mapping_index):
+        """Create 1D histograms for all variables in the current category/alternate combination."""
+        for variable in self.variables:
+            if(variable == "nTotal"):
+                continue
+
+            var_key = self._get_histogram_key(category_name, alt_name, variable)
+
+            combined_mask = self._create_combined_mask(
+                arrays, category_mask, alt_mask, global_filter, variable, mapping_index
+            )
+
+            hist_config = self._get_histogram_config(variable)
+            axis = bh.axis.Regular(
+                bins=hist_config.bins,
+                start=hist_config.start,
+                stop=hist_config.stop,
+            )
+
+            histograms[var_key] = bh.Histogram(axis)
+            histograms[var_key].fill(
+                ak.flatten(arrays[f"{self.config.prefix}_{variable}"][combined_mask])
+            )
+
+        if("nTotal" in self.variables):
+            self._create_nTotal_histogram(
+                arrays, histograms, category_name, alt_name,
+                category_mask, alt_mask, global_filter, mapping_index
+            )
+
+    def _create_2d_histograms(self, arrays, histograms, category_name, alt_name,
+                             category_mask, alt_mask, global_filter, mapping_index):
+        """Create 2D histograms for all variable combinations in the current category/alternate combination."""
+        for var_x, var_y in itertools.combinations(self.variables, 2):
+            if not self._should_create_2d_histogram(var_x, var_y):
+                continue
+
+            if "nTotal" in (var_x, var_y):
+                continue;
+
+            var_key_2d = self._get_2d_histogram_key(category_name, alt_name, var_x, var_y)
+
+            combined_mask = self._create_combined_mask(
+                arrays, category_mask, alt_mask, global_filter, var_x, mapping_index
+            )
+
+            x_config = self._get_histogram_config(var_x)
+            y_config = self._get_histogram_config(var_y)
+
+            x_axis = bh.axis.Regular(
+                bins=x_config.bins,
+                start=x_config.start,
+                stop=x_config.stop,
+            )
+            y_axis = bh.axis.Regular(
+                bins=y_config.bins,
+                start=y_config.start,
+                stop=y_config.stop,
+            )
+
+            histograms[var_key_2d] = bh.Histogram(x_axis, y_axis)
+            histograms[var_key_2d].fill(
+                ak.flatten(arrays[f"{self.config.prefix}_{var_x}"][combined_mask]),
+                ak.flatten(arrays[f"{self.config.prefix}_{var_y}"][combined_mask])
+            )
+    
+    def _get_histogram_key(self, category_name, alt_name, variable):
+        """Generate the key for a 1D histogram."""
+        # Handle default case where category is "all" and no alternate
+        if category_name == 'all' and alt_name is None:
+            return variable
+        
+        if alt_name is not None:
+            return f"{category_name}_{alt_name}_{variable}"
+        return f"{category_name}_{variable}"
+    
+    def _get_2d_histogram_key(self, category_name, alt_name, var_x, var_y):
+        """Generate the key for a 2D histogram."""
+        # Handle default case where category is "all" and no alternate
+        if category_name == 'all' and alt_name is None:
+            return f"{var_y}_vs_{var_x}"
+        
+        if alt_name is not None:
+            return f"{category_name}_{alt_name}_{var_y}_vs_{var_x}"
+        return f"{category_name}_{var_y}_vs_{var_x}"
+    
+
+    def _create_combined_mask(self, arrays, category_mask, alt_mask, global_filter, variable, mapping_index):
+        """Create a combined mask by applying mask mapping and combining all masks."""
+        
+        def safe_map(mask):
+            if mask is None:
+                return ak.Array([True] * len(arrays[f"{self.config.prefix}_{variable}"]))
+            return self._apply_mask_mapping(arrays, mask, variable, mapping_index)
+
+        mapped_category_mask = safe_map(category_mask)
+        mapped_alt_mask = safe_map(alt_mask)
+        mapped_global_filter = safe_map(global_filter)
+
+        return ak.fill_none(
+            mapped_category_mask & mapped_alt_mask & mapped_global_filter,
+            False
+        )
+
+    
+    def _merge_histograms(self, existing_histograms, new_histograms):
+        """Merge new histograms with existing ones, adding values where keys overlap."""
+        for name, hist in new_histograms.items():
+            if name in existing_histograms:
+                existing_histograms[name] += hist
+            else:
+                existing_histograms[name] = hist
+                
+        return existing_histograms
+    
+    def create_histograms(self, input_data) -> Dict[str, bh.Histogram]:
+        """Create histograms for all combinations of categories and variables.
+           Args:
+              input_data: Either a list of file paths (strings) or an events object with iterate method
+        """
         histograms = {}
-        
-        for arrays in events.iterate(filter_name=self._get_branch_names(), step_size=f"{self.memory_size} mB"):
-            arrays = self._compute_derived_variables(arrays)
-            arrays = self._compute_functional_variables(arrays)
-        
-            # Create masks
-            category_masks = self._create_category_masks(arrays)
-            alternate_masks = self._create_alternate_masks(arrays)
 
-            # Apply global filter if specified
-            global_filter = ak.ones_like(arrays[f"{self.config.prefix}_{self.category_masks[0].name}"])
-            if self.config.global_filter is not None:
-                global_filter = self.config.global_filter(arrays)
-        
-            temp_histograms = {}
+        # Determine if input is file paths or events object
+        if isinstance(input_data, list) and all(isinstance(item, str) for item in input_data):
 
-            # Create 1D and 2D histograms for all combinations
-            for category_name, (category_mask, mapping_index) in category_masks.items():
-                for alt_name, alt_mask in alternate_masks.items():
-                    # 1D histograms
-                    for variable in self.variables:
-                        
-                        var_key = f"{category_name}_{variable}"
-                        if(alt_mask is not None):
-                            var_key = f"{category_name}_{alt_name}_{variable}"
-                            
-                        hist_config = self._get_histogram_config(variable)
-                        
-                        # Apply appropriate mask mapping for this variable
-                        mapped_category_mask = self._apply_mask_mapping(
-                            arrays, category_mask, variable, mapping_index
-                        )
-                        
-                        mapped_alt_mask = self._apply_mask_mapping(
-                            arrays, alt_mask, variable, mapping_index
-                        )
-                        
-                        mapped_global_filter = self._apply_mask_mapping(
-                            arrays, global_filter, variable, mapping_index
-                        )
-                        
-                        # Combine masks
-                        combined_mask = ak.fill_none(
-                            mapped_category_mask & mapped_alt_mask & mapped_global_filter, 
-                            False
-                        )
-                        
-                        axis = bh.axis.Regular(
-                            bins=hist_config.bins,
-                            start=hist_config.start,
-                            stop=hist_config.stop,
-                        )
-                        
-                        temp_histograms[var_key] = bh.Histogram(axis)
-                        temp_histograms[var_key].fill(
-                            ak.flatten(arrays[f"{self.config.prefix}_{variable}"][combined_mask])
-                        )
-                        
-                    # 2D histograms
-                    for var_x, var_y in itertools.combinations(self.variables, 2):
-                        if not self._should_create_2d_histogram(var_x, var_y):
-                            continue
-                        
-                        var_key_2d = f"{category_name}_{var_y}_vs_{var_x}"
-                        if(alt_mask is not None):
-                            var_key_2d = f"{category_name}_{alt_name}_{var_y}_vs_{var_x}"
-                            
-                        # Apply appropriate mask mapping for both variables
-                        mapped_category_mask = self._apply_mask_mapping(
-                            arrays, category_mask, var_x, mapping_index
-                        )
-                        mapped_alt_mask = self._apply_mask_mapping(
-                            arrays, alt_mask, var_x, mapping_index
-                        )
-                        mapped_global_filter = self._apply_mask_mapping(
-                            arrays, global_filter, var_x, mapping_index
-                        )
-                        
-                        combined_mask = ak.fill_none(
-                            mapped_category_mask & mapped_alt_mask & mapped_global_filter, 
-                            False
-                        )
-                        
-                        x_config = self._get_histogram_config(var_x)
-                        y_config = self._get_histogram_config(var_y)
-                        
-                        x_axis = bh.axis.Regular(
-                            bins=x_config.bins,
-                            start=x_config.start,
-                            stop=x_config.stop,
-                        )
-                        y_axis = bh.axis.Regular(
-                            bins=y_config.bins,
-                            start=y_config.start,
-                            stop=y_config.stop,
-                        )
-                        
-                        temp_histograms[var_key_2d] = bh.Histogram(x_axis, y_axis)
-                        temp_histograms[var_key_2d].fill(
-                            ak.flatten(arrays[f"{self.config.prefix}_{var_x}"][combined_mask]),
-                            ak.flatten(arrays[f"{self.config.prefix}_{var_y}"][combined_mask])
-                        )
+            # Input is a list of file paths
+            iterator = uproot.iterate(
+                input_data,
+                filter_name=self._get_branch_names(),
+                step_size=f"{self.memory_size} mB"
+            )
+        else:
+            # Input is an events object
+            iterator = input_data.iterate(
+                filter_name=self._get_branch_names(),
+                step_size=f"{self.memory_size} mB"
+            )
 
-            for name, hist in temp_histograms.items():
-                if name in histograms.keys():
-                    histograms[name] += temp_histograms[name]
-                else:
-                    histograms[name] = hist
+        for arrays in iterator:
+            arrays = self._prepare_arrays(arrays)
+            masks = self._prepare_masks(arrays)
+            batch_histograms = self._create_batch_histograms(arrays, masks)
+            histograms = self._merge_histograms(histograms, batch_histograms)
         
         return histograms
